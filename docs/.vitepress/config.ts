@@ -61,6 +61,18 @@ export default defineConfig({
           { text: "Electron observation", link: "/electron-observation" },
           { text: "Electron fuses", link: "/electron-fuses" },
           { text: "Process capture", link: "/process-capture" },
+          {
+            text: "Desktop application capture",
+            link: "/desktop-application-capture",
+          },
+          {
+            text: "Desktop application state",
+            link: "/desktop-application-state",
+          },
+          {
+            text: "Desktop application export",
+            link: "/desktop-application-export",
+          },
           { text: ".NET assemblies", link: "/managed-code-analysis" },
           {
             text: "Python packaged applications",

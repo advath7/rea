@@ -1,0 +1,387 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  electronLaunchArguments,
+  exportInstall,
+  fromUbuntuNobleArchive,
+  installLimitations,
+} from "./appExportInstall.js";
+import type { AptRepository, DesktopPackage } from "./desktopCapture.js";
+
+const TYPORA_SOURCE = "https://downloads.typora.io/linux ./ Packages";
+
+const KEY = {
+  path: "/etc/apt/trusted.gpg.d/typora.gpg",
+  sha256: "a".repeat(64),
+  format: "binary",
+  fingerprint: "4AC441BE68B4ADAB7439FBF9BA300B7755AFCFAE",
+} as const;
+
+const repository = (overrides: Partial<AptRepository> = {}): AptRepository => ({
+  source: TYPORA_SOURCE,
+  sources_file: "/etc/apt/sources.list.d/typora.list",
+  uri: "https://downloads.typora.io/linux",
+  suite: "./",
+  components: [],
+  architectures: [],
+  release: "stable",
+  signing_key: KEY,
+  ...overrides,
+});
+
+const typora = (
+  repositories: readonly AptRepository[] | undefined,
+): DesktopPackage => ({
+  kind: "deb",
+  name: "typora:arm64",
+  version: "1.14.9-1",
+  architecture: "arm64",
+  sources: [TYPORA_SOURCE],
+  source_origins: ["typora.io"],
+  package_lists_present: true,
+  ...(repositories === undefined
+    ? {}
+    : { apt_repositories: [...repositories] }),
+  library_packages: ["libgbm1", "libnss3"],
+  missing_libraries: [],
+  unpackaged_libraries: [],
+});
+
+describe("exportInstall", () => {
+  it("installs from a vendor repository whose key the capture verified", () => {
+    const install = exportInstall(typora([repository()]), "typora", "arm64");
+
+    expect(install).toEqual({
+      ok: true,
+      value: {
+        aptPackage: "typora",
+        release: "stable",
+        libraryPackages: ["libgbm1", "libnss3"],
+        sources: [
+          {
+            uri: "https://downloads.typora.io/linux",
+            suite: "./",
+            components: [],
+            keyFile: "apt-keys/typora.gpg",
+            keySha256: "a".repeat(64),
+          },
+        ],
+        skipped: [],
+        architectures: ["arm64"],
+      },
+    });
+  });
+
+  it("names an armored key .asc and shares one file between repositories with the same key", () => {
+    const armored = repository({
+      uri: "https://example.com/apt",
+      suite: "stable",
+      components: ["main"],
+      signing_key: {
+        path: "/usr/share/keyrings/example.asc",
+        sha256: "b".repeat(64),
+        format: "armored",
+        fingerprint: "F",
+      },
+    });
+    const install = exportInstall(
+      typora([
+        repository(),
+        armored,
+        repository({ uri: "https://mirror.example.com/typora" }),
+      ]),
+      "typora",
+      "arm64",
+    );
+
+    expect(
+      install.ok && install.value.sources.map((source) => source.keyFile),
+    ).toEqual([
+      "apt-keys/typora.gpg",
+      "apt-keys/typora-2.asc",
+      "apt-keys/typora.gpg",
+    ]);
+  });
+
+  it("refuses a vendor repository whose key was not verified, naming it and the reason", () => {
+    const install = exportInstall(
+      typora([
+        repository({
+          signing_key: null,
+          signing_key_reason: "gpgv is not installed",
+        }),
+      ]),
+      "typora",
+      "arm64",
+    );
+
+    expect(install).toEqual({
+      ok: false,
+      error: expect.stringContaining(
+        "https://downloads.typora.io/linux ./: gpgv is not installed",
+      ),
+    });
+  });
+
+  it("leaves out an unverified repository when another one verified", () => {
+    const install = exportInstall(
+      typora([
+        repository({
+          uri: "http://ftp.example.com/typora",
+          signing_key: null,
+          signing_key_reason: "no candidate key verifies it",
+        }),
+        repository(),
+      ]),
+      "typora",
+      "arm64",
+    );
+
+    expect(install.ok && install.value.skipped).toEqual([
+      "http://ftp.example.com/typora ./: no candidate key verifies it",
+    ]);
+    expect(install.ok && install.value.sources).toHaveLength(1);
+  });
+
+  it("refuses repositories agentenv cannot fetch, captures without repositories, and other package kinds", () => {
+    expect(
+      exportInstall(
+        typora([repository({ uri: "file:/srv/apt" })]),
+        "typora",
+        "arm64",
+      ),
+    ).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("http or https"),
+    });
+    expect(exportInstall(typora(undefined), "typora", "arm64")).toMatchObject({
+      ok: false,
+      error: expect.stringContaining(
+        "not installed from the Ubuntu 24.04 package archive or a vendor apt repository",
+      ),
+    });
+    expect(
+      exportInstall(
+        { ...typora(undefined), kind: "snap", name: "typora" },
+        "typora",
+        "arm64",
+      ),
+    ).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("not an apt package (snap typora"),
+    });
+  });
+
+  it("installs an Ubuntu archive package by name, trusting its declared dependencies", () => {
+    const install = exportInstall(
+      {
+        ...typora(undefined),
+        name: "mousepad",
+        sources: [
+          "http://archive.ubuntu.com/ubuntu noble/universe amd64 Packages",
+        ],
+        source_origins: ["Ubuntu"],
+      },
+      "mousepad",
+      "arm64",
+    );
+
+    expect(install).toMatchObject({
+      ok: true,
+      value: {
+        aptPackage: "mousepad",
+        release: null,
+        sources: [],
+        libraryPackages: [],
+        architectures: ["amd64", "arm64"],
+      },
+    });
+  });
+});
+
+describe("exportInstall sources", () => {
+  const amd64 = "https://apt.example.com/repo stable/main amd64 Packages";
+  const i386 = "https://apt.example.com/repo stable/main i386 Packages";
+  const multiarch = (overrides: Partial<AptRepository> = {}) =>
+    repository({
+      source: amd64,
+      uri: "https://apt.example.com/repo",
+      suite: "stable",
+      components: ["main"],
+      ...overrides,
+    });
+
+  it("declares one source per URI and suite, merging the components of entries with the same key", () => {
+    const install = exportInstall(
+      typora([
+        multiarch(),
+        multiarch({ source: i386 }),
+        multiarch({ components: ["contrib"] }),
+        multiarch({
+          components: ["extra"],
+          signing_key: { ...KEY, sha256: "c".repeat(64) },
+        }),
+      ]),
+      "typora",
+      "x64",
+    );
+
+    if (!install.ok) throw new Error(install.error);
+    expect(install.value.sources).toEqual([
+      {
+        uri: "https://apt.example.com/repo",
+        suite: "stable",
+        components: ["main", "contrib"],
+        keyFile: "apt-keys/typora.gpg",
+        keySha256: "a".repeat(64),
+      },
+    ]);
+    expect(install.value.skipped).toEqual([
+      "https://apt.example.com/repo stable extra: apt takes one key per URI and suite, and apt-keys/typora.gpg is declared for them",
+    ]);
+    expect(install.value.architectures).toEqual(["amd64"]);
+  });
+
+  it("takes the package from the first declared release, or by name when the release names none", () => {
+    const declared = exportInstall(
+      typora([
+        repository({
+          release: "beta",
+          signing_key: null,
+          signing_key_reason: "gpgv is not installed",
+        }),
+        repository({ uri: "https://b.example.com/typora" }),
+      ]),
+      "typora",
+      "arm64",
+    );
+    const named = exportInstall(
+      typora([
+        repository({ release: null }),
+        repository({ uri: "https://b.example.com/typora" }),
+      ]),
+      "typora",
+      "arm64",
+    );
+
+    expect(declared.ok && declared.value.release).toBe("stable");
+    expect(named.ok && named.value.release).toBeNull();
+  });
+
+  it("supports only the capture host's architecture and leaves out a repository restricted to others", () => {
+    const install = exportInstall(
+      typora([
+        repository({
+          uri: "https://amd64-only.example.com",
+          architectures: ["amd64"],
+        }),
+        repository({ architectures: ["arm64", "amd64"] }),
+      ]),
+      "typora",
+      "arm64",
+    );
+
+    expect(install.ok && install.value.architectures).toEqual(["arm64"]);
+    expect(install.ok && install.value.skipped).toEqual([
+      "https://amd64-only.example.com ./: it serves only amd64, not the capture host's arm64",
+    ]);
+    expect(
+      exportInstall(typora([repository()]), "typora", "riscv64"),
+    ).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("architecture riscv64"),
+    });
+  });
+});
+
+describe("electronLaunchArguments", () => {
+  it("turns Chromium's sandbox off right after an Electron program, once", () => {
+    expect(electronLaunchArguments(["typora", "/home/ada/a.md"], true)).toEqual(
+      ["typora", "--no-sandbox", "/home/ada/a.md"],
+    );
+    expect(electronLaunchArguments(["typora", "--no-sandbox"], true)).toEqual([
+      "typora",
+      "--no-sandbox",
+    ]);
+    expect(electronLaunchArguments(["mousepad"], false)).toEqual(["mousepad"]);
+  });
+
+  it("puts it after the program an env wrapper launches, not after env", () => {
+    expect(
+      electronLaunchArguments(
+        ["env", "APP_MODE=desktop", "/opt/app/app", "%U"],
+        true,
+      ),
+    ).toEqual([
+      "env",
+      "APP_MODE=desktop",
+      "/opt/app/app",
+      "--no-sandbox",
+      "%U",
+    ]);
+  });
+});
+
+describe("installLimitations", () => {
+  it("says where the package comes from, which libraries are unmapped and that the sandbox is off", () => {
+    const installed: DesktopPackage = {
+      ...typora([repository()]),
+      missing_libraries: ["libfoo.so.1"],
+      uninstallable_library_packages: ["libppa1"],
+      library_packages_reason: "REA stopped after 512 libraries",
+    };
+    const install = exportInstall(installed, "typora", "arm64");
+    if (!install.ok) throw new Error(install.error);
+
+    const limitations = installLimitations(install.value, installed, true).join(
+      "\n",
+    );
+
+    expect(limitations).toContain(
+      "installed as typora/stable from https://downloads.typora.io/linux",
+    );
+    expect(limitations).toContain(
+      "only the capture host's architecture, arm64",
+    );
+    expect(limitations).toContain(
+      "REA stopped after 512 libraries; not found on the capture host: libfoo.so.1; in packages neither the Ubuntu 24.04 archive nor a declared repository offers: libppa1",
+    );
+    expect(limitations).toContain("Chromium's sandbox is off");
+  });
+});
+
+describe("fromUbuntuNobleArchive", () => {
+  const mirror = "http://mirror.local/ubuntu noble/universe amd64 Packages";
+  const ports =
+    "http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 Packages";
+
+  it("trusts apt's origin, so mirrors count and other repositories do not", () => {
+    expect(fromUbuntuNobleArchive([mirror], ["Ubuntu"])).toBe(true);
+    expect(
+      fromUbuntuNobleArchive(
+        [
+          "https://ppa.launchpadcontent.net/a/b/ubuntu noble/main amd64 Packages",
+        ],
+        ["LP-PPA-a-b"],
+      ),
+    ).toBe(false);
+    expect(
+      fromUbuntuNobleArchive(
+        ["https://dl.winehq.org/wine-builds/ubuntu noble/main amd64 Packages"],
+        [null],
+      ),
+    ).toBe(false);
+    expect(
+      fromUbuntuNobleArchive(
+        ["http://archive.ubuntu.com/ubuntu jammy/universe amd64 Packages"],
+        ["Ubuntu"],
+      ),
+    ).toBe(false);
+  });
+
+  it("accepts only Canonical's hosts when the capture recorded no origins", () => {
+    expect(fromUbuntuNobleArchive([ports], undefined)).toBe(true);
+    expect(fromUbuntuNobleArchive([mirror], undefined)).toBe(false);
+    expect(fromUbuntuNobleArchive([], [])).toBe(false);
+  });
+});
